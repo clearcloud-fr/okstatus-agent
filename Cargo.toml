@@ -1,0 +1,37 @@
+[package]
+name = "okstatus-agent"
+version = "0.5.10"
+edition = "2021"
+
+[[bin]]
+name = "okstatus-agent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+# OKS-169 — "stream" enables Response::bytes_stream(), needed to read LLM
+# provider SSE bodies incrementally instead of buffering the whole response
+# (the existing http.rs check only ever awaits the full body).
+reqwest = { version = "0.12", features = ["json", "native-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+x509-parser = "0.16"
+prometheus = "0.13"
+base64 = "0.22"
+hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+hostname = "0.4"
+# OKS-169 — LLM canary checks (checks/llm.rs)
+futures-util = "0.3"
+regex = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-bedrockruntime = "1"
+# OKS-474 — gRPC health checks (checks/grpc.rs): standard grpc.health.v1
+# Health/Check via tonic; tonic-health ships the generated client stubs.
+tonic = { version = "0.12", features = ["tls", "tls-roots"] }
+tonic-health = "0.12"

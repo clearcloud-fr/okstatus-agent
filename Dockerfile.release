@@ -1,0 +1,16 @@
+# OKS-602 — release image: packages a binary already built natively by the
+# GitHub release workflow (one job per arch, no QEMU cross-compilation), then
+# merged into a multi-arch manifest. The plain `Dockerfile` builds from
+# source and stays the local/dev path.
+FROM debian:bookworm-slim
+ARG TARGETARCH
+ARG APP_VERSION=""
+ENV APP_VERSION=$APP_VERSION
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libssl3 ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -r agent && useradd -r -g agent -u 1001 agent
+COPY dist/okstatus-agent-linux-${TARGETARCH} /usr/local/bin/okstatus-agent
+USER 1001
+EXPOSE 9091
+CMD ["okstatus-agent"]

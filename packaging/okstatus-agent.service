@@ -1,0 +1,29 @@
+# Standalone unit for manual installs (install.sh writes the same one).
+[Unit]
+Description=OKStatus private monitoring agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=okstatus-agent
+Group=okstatus-agent
+EnvironmentFile=/etc/okstatus-agent/okstatus-agent.env
+ExecStart=/usr/local/bin/okstatus-agent
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/okstatus-agent
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
