@@ -236,15 +236,26 @@ fn evaluate_body_match(task: &CheckTask, body: Option<&str>) -> (bool, Option<St
         let Some(body) = body else {
             return (false, Some("Failed to read response body for JSON match".into()));
         };
-        let parsed: serde_json::Value = match serde_json::from_str(body) {
-            Ok(v) => v,
-            Err(e) => return (false, Some(format!("JSON parse error: {e}"))),
-        };
 
-        // Simple dot-notation path traversal (e.g. "data.status", "items.0.name")
-        let value = resolve_json_path(&parsed, json_path);
-        let Some(value) = value else {
-            return (false, Some(format!("JSON path '{}' not found", json_path)));
+        // "$" alone = compare the raw (trimmed) body as a string, no JSON
+        // parse — for plain-text endpoints ("OK", "pong"…). Otherwise a
+        // simple dot-notation path traversal (e.g. "data.status",
+        // "items.0.name"); a leading "$." is accepted and ignored.
+        let actual_str = if json_path.trim() == "$" {
+            body.trim().to_string()
+        } else {
+            let parsed: serde_json::Value = match serde_json::from_str(body) {
+                Ok(v) => v,
+                Err(e) => return (false, Some(format!("JSON parse error: {e}"))),
+            };
+            let value = resolve_json_path(&parsed, json_path);
+            let Some(value) = value else {
+                return (false, Some(format!("JSON path '{}' not found", json_path)));
+            };
+            match value {
+                serde_json::Value::String(s) => s.to_string(),
+                other => other.to_string(),
+            }
         };
 
         let Some(ref operator) = task.json_operator else {
@@ -253,11 +264,6 @@ fn evaluate_body_match(task: &CheckTask, body: Option<&str>) -> (bool, Option<St
         };
         let Some(ref expected) = task.json_expected_value else {
             return (true, None);
-        };
-
-        let actual_str = match value {
-            serde_json::Value::String(s) => s.to_string(),
-            other => other.to_string(),
         };
 
         let matched = match operator.as_str() {
@@ -295,6 +301,11 @@ fn evaluate_body_match(task: &CheckTask, body: Option<&str>) -> (bool, Option<St
 /// Resolve a simple dot-notation JSON path (e.g. "data.status", "items.0.name").
 fn resolve_json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     let mut current = value;
+    let path = path.trim();
+    let path = path.strip_prefix("$.").or_else(|| path.strip_prefix('$')).unwrap_or(path);
+    if path.is_empty() {
+        return Some(current);
+    }
     for segment in path.split('.') {
         if let Ok(idx) = segment.parse::<usize>() {
             current = current.get(idx)?;

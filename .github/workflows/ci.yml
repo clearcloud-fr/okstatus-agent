@@ -1,0 +1,26 @@
+# Build check on pull requests. Releases are cut from tags by release.yml.
+name: ci
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cargo-home/registry
+            .cargo-home/git
+            target
+          key: ci-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-cargo-
+      - name: cargo build
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            -e CARGO_HOME=/w/.cargo-home -e CARGO_TERM_COLOR=always \
+            rust:1.97-bookworm cargo build --release --locked
+          sudo chown -R "$(id -u):$(id -g)" .cargo-home target
