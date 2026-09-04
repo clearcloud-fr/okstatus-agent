@@ -63,6 +63,10 @@ jobs:
       - name: Build
         run: |
           sed -i "0,/^version = \".*\"/s//version = \"$APP_VERSION\"/" Cargo.toml
+          # …and in the lock file too, otherwise --locked rejects the build
+          # ("cannot update the lock file") because the package it records is
+          # still on the Cargo.toml version we just rewrote.
+          sed -i '/^name = "okstatus-agent"$/{n;s/^version = ".*"/version = "'"$APP_VERSION"'"/}' Cargo.lock
           docker run --rm \
             -v "$PWD":/w -w /w \
             -e CARGO_HOME=/w/.cargo-home \
