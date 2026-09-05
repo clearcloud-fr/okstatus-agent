@@ -35,3 +35,8 @@ aws-sdk-bedrockruntime = "1"
 # Health/Check via tonic; tonic-health ships the generated client stubs.
 tonic = { version = "0.12", features = ["tls", "tls-roots"] }
 tonic-health = "0.12"
+surge-ping = "0.8"
+tokio-postgres = "0.7.18"
+postgres-native-tls = "0.5.3"
+mongodb = "3.9.0"
+mysql_async = { version = "0.37.1", default-features = false, features = ["native-tls-tls", "minimal-rust"] }

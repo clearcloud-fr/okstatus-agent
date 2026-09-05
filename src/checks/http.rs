@@ -75,6 +75,25 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
     let mut current_target = task.target.clone();
     let mut hops = 0u8;
 
+    // OKS-668 — the same private-address guard the redirect hops get, on the
+    // first hop. The backend only vets the literal hostname at creation time;
+    // a public name pointed at 10.x afterwards (or resolving differently from
+    // inside our network) reached this request unchecked.
+    if !crate::ssrf::allow_private_targets() {
+        if let Ok(url) = reqwest::Url::parse(&current_target) {
+            let host = url.host_str().unwrap_or_default().to_string();
+            let port = url.port_or_known_default().unwrap_or(443);
+            if crate::ssrf::is_private_hostname(&host) {
+                return error_result(task, &start, format!("Target is a private address: {host}"));
+            }
+            if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
+                if addrs.into_iter().any(|a| crate::ssrf::is_private_ip(&a.ip())) {
+                    return error_result(task, &start, format!("Target resolves to a private address: {host}"));
+                }
+            }
+        }
+    }
+
     let resp = loop {
         let elapsed = start.elapsed();
         if elapsed >= timeout {

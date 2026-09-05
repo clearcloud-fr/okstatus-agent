@@ -23,14 +23,45 @@ RUN if [ -n "$APP_VERSION" ]; then \
       sed -i "0,/^version = \".*\"/s//version = \"$APP_VERSION\"/" Cargo.toml; \
     fi && cargo build --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libssl3 ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd -r agent && useradd -r -g agent -u 1001 agent
-COPY --from=builder /app/target/release/okstatus-agent /usr/local/bin/
+# OKS-689 — runtime is distroless, not debian:bookworm-slim.
+#
+# The Debian base contributed all 56 of this image's CVE findings, including
+# every one of its 4 criticals (perl-base x3, zlib1g) — and none of those has a
+# fix: not in bookworm, and not in trixie either, which was scanned and carries
+# the very same perl CVEs. They were also for packages the agent never touches;
+# perl, ncurses, gzip and coreutils were only ever there because a Debian base
+# ships them. gcr.io/distroless/cc-debian12 is 11 packages and scans clean.
+#
+# It is still bookworm underneath (glibc 2.36), so it stays in lockstep with the
+# rust:1.97-bookworm builder above — see that stage's comment about the 0.23.2
+# "GLIBC_2.38 not found" release. Keep both on the same Debian generation.
+#
+# What the binary actually needs, from `ldd`: libssl.so.3, libcrypto.so.3,
+# libgcc_s.so.1, libm.so.6, libc.so.6. distroless/cc-debian12 provides all of
+# them, plus /etc/ssl/certs/ca-certificates.crt for TLS verification,
+# /etc/nsswitch.conf with the libnss_dns/libnss_files modules for DNS (an agent
+# that cannot resolve hostnames is useless), and netbase's /etc/protocols, which
+# surge-ping needs to look up the ICMP protocol number.
+#
+# The `libz.so.1` that used to be in that ldd list is gone on purpose: it came
+# from mysql_async's `minimal` feature, which despite its name selects flate2's
+# C zlib backend. Cargo.toml now asks for `minimal-rust` (miniz_oxide, pure
+# Rust) instead. That is what makes distroless viable — it ships no zlib, and
+# the alternative was copying libz.so.1 in by hand, which would have hidden the
+# package from the scanner rather than removed it.
+#
+# Verified by running this exact binary in a distroless container under the
+# runtime's own conditions (uid 1001, no /etc/passwd entry for it): banner and
+# health server up, DNS resolved, TLS handshake to backend.okstatus.eu
+# completed and returned a real HTTP 401 for the bogus secret, clean shutdown.
+FROM gcr.io/distroless/cc-debian12
+COPY --from=builder /app/target/release/okstatus-agent /usr/local/bin/okstatus-agent
 ARG APP_VERSION=""
 ENV APP_VERSION=$APP_VERSION
-USER 1001
+# Numeric form: distroless has no useradd, and no passwd entry is needed — the
+# previous `groupadd`/`useradd` existed only to give this uid a name.
+USER 1001:1001
 EXPOSE 8081
-CMD ["okstatus-agent"]
+# Absolute path rather than a PATH lookup: distroless has no shell to fall back
+# on. Github/sync.sh rewrites this path for the public repo's binary name.
+CMD ["/usr/local/bin/okstatus-agent"]

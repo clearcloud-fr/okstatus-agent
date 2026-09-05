@@ -1,3 +1,4 @@
+pub mod db;
 pub mod grpc;
 pub mod dns;
 pub mod http;

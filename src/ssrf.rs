@@ -14,6 +14,28 @@ pub fn allow_private_targets() -> bool {
     ALLOW_PRIVATE_TARGETS.load(Ordering::Relaxed)
 }
 
+// OKS-668 — names that only ever resolve inside a cluster or a LAN. Mirrors
+// isPrivateHostname() in the backend (shared/url-validator.ts); checked
+// BEFORE resolving so a cluster-internal name is refused even when the
+// agent's own resolver would happily answer it.
+const PRIVATE_HOSTNAME_SUFFIXES: &[&str] =
+    &[".localhost", ".local", ".internal", ".svc", ".cluster.local", ".lan", ".home.arpa"];
+
+pub fn is_private_hostname(host: &str) -> bool {
+    let h = host.trim_end_matches('.').to_ascii_lowercase();
+    if h == "localhost" || h == "metadata.google.internal" || h == "instance-data" {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<IpAddr>() {
+        return is_private_ip(&ip);
+    }
+    if PRIVATE_HOSTNAME_SUFFIXES.iter().any(|s| h.ends_with(s)) {
+        return true;
+    }
+    // Single-label names (`postgres`, `redis`) only resolve via a search domain.
+    !h.contains('.')
+}
+
 /// Returns true if the given IP address is private, reserved, loopback, or link-local.
 /// Used to prevent SSRF attacks via DNS server configuration or HTTP redirects.
 pub fn is_private_ip(ip: &IpAddr) -> bool {
@@ -66,6 +88,16 @@ mod tests {
         for (ip_str, expected) in cases {
             let ip: IpAddr = ip_str.parse().unwrap();
             assert_eq!(is_private_ip(&ip), expected, "failed for {ip_str}");
+        }
+    }
+
+    #[test]
+    fn test_private_hostname() {
+        for h in ["redis", "db.svc", "api.okstatus.svc.cluster.local", "foo.internal", "localhost", "10.0.0.1", "fd00::1"] {
+            assert!(is_private_hostname(h), "{h}");
+        }
+        for h in ["example.com", "node1.database.cloud.ovh.net", "8.8.8.8"] {
+            assert!(!is_private_hostname(h), "{h}");
         }
     }
 

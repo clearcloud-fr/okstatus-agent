@@ -67,6 +67,10 @@ pub struct CheckTask {
     pub llm_api_key: Option<String>,
     #[serde(default)]
     pub llm_config: Option<Value>,
+    // OKS-668 — database checks (checks/db.rs): the query / command to run
+    // after connecting. None = the type's default (SELECT 1 / { ping: 1 }).
+    #[serde(default)]
+    pub db_query: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -79,6 +83,10 @@ pub enum CheckType {
     Llm,
     // OKS-474 — grpc.health.v1 health checks (checks/grpc.rs)
     Grpc,
+    // OKS-668 — database checks (checks/db.rs). "mysql" covers MariaDB too.
+    Postgres,
+    Mysql,
+    Mongodb,
     // Catch-all for any check_type the aggregator sends that this build
     // doesn't know about yet (e.g. a new check type shipped server-side
     // before this agent image was rebuilt/redeployed). Without this,
@@ -165,6 +173,9 @@ mod tests {
             ("dns", CheckType::Dns),
             ("llm", CheckType::Llm),
             ("grpc", CheckType::Grpc),
+            ("postgres", CheckType::Postgres),
+            ("mysql", CheckType::Mysql),
+            ("mongodb", CheckType::Mongodb),
         ] {
             let json = format!(r#""{}""#, raw);
             let parsed: CheckType = serde_json::from_str(&json).unwrap();

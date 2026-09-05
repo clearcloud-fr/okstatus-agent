@@ -2,15 +2,30 @@
 # GitHub release workflow (one job per arch, no QEMU cross-compilation), then
 # merged into a multi-arch manifest. The plain `Dockerfile` builds from
 # source and stays the local/dev path.
-FROM debian:bookworm-slim
+#
+# OKS-689 — runtime is distroless instead of debian:bookworm-slim. On the fleet
+# image the same swap removed all 56 CVE findings, criticals included (perl-base
+# x3 and zlib1g, none of which Debian has a fix for, in bookworm or in trixie),
+# for packages this agent never touches.
+#
+# glibc compatibility is unchanged by the move: distroless/cc-debian12 is
+# bookworm underneath, so it is the same glibc 2.36 this image already ran on
+# while the release workflow builds on ubuntu-24.04 runners. If a future
+# toolchain bump starts emitting newer symbol versions, this breaks exactly the
+# way debian:bookworm-slim already would — see the 0.23.2 "GLIBC_2.38 not
+# found" release.
+#
+# The base ships no zlib. That is fine because Cargo.toml selects mysql_async's
+# `minimal-rust` feature (flate2's pure-Rust backend) rather than `minimal`,
+# which despite the name links C zlib. A binary built from a tree predating that
+# change will fail here with "libz.so.1: cannot open shared object file".
+FROM gcr.io/distroless/cc-debian12
 ARG TARGETARCH
 ARG APP_VERSION=""
 ENV APP_VERSION=$APP_VERSION
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libssl3 ca-certificates && \
-    rm -rf /var/lib/apt/lists/* && \
-    groupadd -r agent && useradd -r -g agent -u 1001 agent
 COPY dist/okstatus-agent-linux-${TARGETARCH} /usr/local/bin/okstatus-agent
-USER 1001
+# Numeric form: distroless has no useradd, and the binary needs no passwd entry.
+USER 1001:1001
 EXPOSE 9091
-CMD ["okstatus-agent"]
+# Absolute path — distroless has no shell for a PATH lookup.
+CMD ["/usr/local/bin/okstatus-agent"]

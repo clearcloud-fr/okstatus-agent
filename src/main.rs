@@ -553,6 +553,9 @@ async fn poll_and_execute(
                 CheckType::Dns => "dns",
                 CheckType::Llm => "llm",
                 CheckType::Grpc => "grpc",
+                CheckType::Postgres => "postgres",
+                CheckType::Mysql => "mysql",
+                CheckType::Mongodb => "mongodb",
                 // Unreachable in practice — the outer loop `continue`s past
                 // CheckType::Unknown before spawning this task at all.
                 CheckType::Unknown => "unknown",
@@ -589,6 +592,8 @@ async fn execute_check(client: &reqwest::Client, task: &CheckTask) -> CheckResul
         CheckType::Dns => checks::dns::check_dns(task).await,
         CheckType::Llm => checks::llm::check_llm(client, task).await,
         CheckType::Grpc => checks::grpc::check_grpc(task).await,
+        // OKS-668 — one handler for the three database dialects.
+        CheckType::Postgres | CheckType::Mysql | CheckType::Mongodb => checks::db::check_db(task).await,
         // The poll loop `continue`s past CheckType::Unknown before this is
         // ever called (see poll_and_execute) — there's no handler to run an
         // unrecognized check type with.
