@@ -33,9 +33,48 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
         }
     }
 
+    // Authentification non-Basic (auth.rs). Bearer / clé d'API / cookie ne
+    // touchent qu'aux en-têtes et à l'URL ; OAuth2 demande d'abord un jeton
+    // (mis en cache jusqu'à expiration) ; mTLS impose son propre client.
+    let auth = crate::auth::parse(task.auth_config.as_ref());
+    let mut authed_target = task.target.clone();
+    if let Some(ref auth) = auth {
+        authed_target = crate::auth::apply_static(auth, &mut headers, authed_target);
+    }
+    if let Some(crate::auth::MonitorAuth::Oauth2(ref oauth)) = auth {
+        // Le jeton se prend sur le budget de temps du check : un IdP lent
+        // doit se voir dans la latence, pas déborder silencieusement.
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return error_result(task, &start, "Timeout before the OAuth2 token request".into());
+        }
+        match crate::auth::oauth2_token(client, oauth, remaining).await {
+            Ok(token) => {
+                if let Ok(value) = HeaderValue::from_str(&format!("Bearer {token}")) {
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+            }
+            // Panne de l'émetteur de jetons ≠ panne de la cible : le message
+            // doit le dire, sinon on cherche au mauvais endroit.
+            Err(e) => return error_result(task, &start, format!("OAuth2 authentication failed: {e}")),
+        }
+    }
+
     // OKS-472 — per-monitor TLS validation opt-out: swap in the shared
     // insecure client (falls back to the normal one if it failed to build).
-    let client = if task.ignore_tls == Some(true) {
+    // Un client mTLS, lui, porte déjà le réglage de vérification.
+    let mtls_client = match auth {
+        Some(crate::auth::MonitorAuth::Mtls(ref mtls)) => {
+            match crate::auth::mtls_client(mtls, task.ignore_tls == Some(true)) {
+                Ok(c) => Some(c),
+                Err(e) => return error_result(task, &start, format!("mTLS setup failed: {e}")),
+            }
+        }
+        _ => None,
+    };
+    let client = if let Some(ref client) = mtls_client {
+        client
+    } else if task.ignore_tls == Some(true) {
         INSECURE_CLIENT.as_ref().unwrap_or(client)
     } else {
         client
@@ -72,7 +111,7 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
     // IP guard before being fetched; the whole chain shares the check's one
     // timeout budget, and the final response is what gets classified.
     let follow_redirects = task.follow_redirects.unwrap_or(true);
-    let mut current_target = task.target.clone();
+    let mut current_target = authed_target;
     let mut hops = 0u8;
 
     // OKS-668 — the same private-address guard the redirect hops get, on the
@@ -113,7 +152,7 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
 
         let resp = match request.send().await {
             Ok(r) => r,
-            Err(e) => return error_result(task, &start, e.to_string()),
+            Err(e) => return error_result(task, &start, error_chain(&e)),
         };
 
         let status = resp.status().as_u16();
@@ -199,9 +238,7 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
     // Capture body for keyword/JSON matching (limit 1MB)
     let needs_body = task.keyword.is_some() || task.json_path.is_some();
     let body_text = if needs_body {
-        resp.text().await.ok().map(|t| {
-            if t.len() > 1_048_576 { t[..1_048_576].to_string() } else { t }
-        })
+        read_body_capped(resp, BODY_CAP_BYTES).await
     } else {
         drop(resp);
         None
@@ -361,6 +398,27 @@ fn is_status_accepted(status: u16, accepted: Option<&[String]>) -> bool {
     false
 }
 
+/// The whole cause chain of a request error, outermost first.
+///
+/// reqwest's Display stops at "error sending request for url (…)": for a
+/// refused client certificate, an unknown server CA or a reset, the only
+/// reason the user could act on lived in `source()`, and the check history
+/// said nothing more (QA auth server, 2026-09-14). Secrets that a cause might
+/// quote are scrubbed afterwards by `execute_check`.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = cause.source();
+    }
+    message
+}
+
 fn error_result(task: &CheckTask, start: &Instant, error: String) -> CheckResult {
     CheckResult {
         task_id: task.task_id.clone(),
@@ -404,6 +462,7 @@ static INSECURE_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(crate::ssrf::GuardedResolver)) // F7
         .build()
         .ok()
 });
@@ -476,4 +535,72 @@ async fn fetch_ssl_days(host: &str) -> Option<i64> {
     let days_left = (expiry_ts - now_ts) / 86_400;
 
     Some(days_left)
+}
+
+/// Upper bound on what a keyword/JSON check will read from a target.
+const BODY_CAP_BYTES: usize = 1_048_576;
+
+/// OKS-414 #10 — read at most `cap` bytes of the body, chunk by chunk, and
+/// stop pulling from the socket once the cap is reached. `resp.text()` used
+/// to buffer the *whole* body first and only then slice it, so one target
+/// answering a multi-GB body could spike the shared agent's memory. The
+/// lossy UTF-8 conversion also removes the old panic risk of slicing a
+/// String on a non-char boundary.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Option<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                let room = cap - buf.len();
+                if chunk.len() >= room {
+                    buf.extend_from_slice(&chunk[..room]);
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+#[cfg(test)]
+mod error_chain_tests {
+    use super::error_chain;
+    use std::fmt;
+
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl fmt::Display for Layer {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn keeps_the_root_cause_a_tls_failure_hides_behind() {
+        let err = Layer(
+            "error sending request for url (https://auth.internal:8443/mtls)",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer("tlsv13 alert certificate required", None))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&err),
+            "error sending request for url (https://auth.internal:8443/mtls): client error (Connect): tlsv13 alert certificate required"
+        );
+    }
+
+    #[test]
+    fn does_not_repeat_a_cause_already_in_the_message() {
+        let err = Layer("timed out: operation timed out", Some(Box::new(Layer("operation timed out", None))));
+        assert_eq!(error_chain(&err), "timed out: operation timed out");
+    }
 }

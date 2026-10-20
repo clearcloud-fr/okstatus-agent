@@ -3,6 +3,20 @@
 All notable changes to the OKStatus agent are documented here. Versions
 follow the GitHub release tags (`vX.Y.Z`).
 
+## v1.1.0 — 2026-10-20
+
+- Sealed task secrets: monitor credentials (headers, body, Basic auth,
+  authentication settings, LLM API key) now reach the agent encrypted for
+  it alone (X25519 + ChaCha20-Poly1305). The key is derived from
+  `OKSTATUS_AGENT_SECRET`, so there is nothing new to configure; the agent
+  publishes the public half with its heartbeat. A task it cannot open is
+  skipped and counted in `uptime_agent_sealed_tasks_unreadable_total`,
+  never run without its credentials.
+- Monitor authentication (API key, bearer token…) for HTTP checks.
+- SMTP, IMAP and Redis checks.
+- The heartbeat reports where the agent runs (hostname, private IP,
+  platform), shown on the Private Agents page.
+
 ## v1.0.0 — 2026-09-04
 
 First public release.

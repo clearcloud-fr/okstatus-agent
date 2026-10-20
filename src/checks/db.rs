@@ -294,16 +294,24 @@ async fn ensure_public(dsn: &Dsn, default_port: u16) -> Result<(), String> {
     }
     let mut targets: Vec<(String, u16)> = Vec::new();
     if dsn.scheme == "mongodb+srv" {
-        use hickory_resolver::config::{ResolverConfig, ResolverOpts};
-        use hickory_resolver::TokioAsyncResolver;
-        let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        use hickory_resolver::Resolver;
+        // Same empty-ResolverConfig::default() trap as the DNS check (hickory
+        // 0.26): every mongodb+srv SRV lookup failed "no connections available".
+        let (config, options) = super::dns::default_resolver_config();
+        let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(options)
+            .build()
+            .map_err(|e| format!("Resolver setup failed: {e}"))?;
         for (host, _) in &dsn.hosts {
             let srv = resolver
-                .srv_lookup(format!("_mongodb._tcp.{host}"))
+                .lookup(format!("_mongodb._tcp.{host}"), hickory_resolver::proto::rr::RecordType::SRV)
                 .await
                 .map_err(|e| format!("SRV lookup failed for {host}: {e}"))?;
-            for record in srv.iter() {
-                targets.push((record.target().to_utf8().trim_end_matches('.').to_string(), record.port()));
+            for record in srv.answers() {
+                if let hickory_resolver::proto::rr::RData::SRV(record) = &record.data {
+                    targets.push((record.target.to_utf8().trim_end_matches('.').to_string(), record.port));
+                }
             }
         }
     } else {

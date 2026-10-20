@@ -42,6 +42,13 @@ pub struct CheckTask {
     pub basic_auth_user: Option<String>,
     #[serde(default)]
     pub basic_auth_pass: Option<String>,
+    // Authentification non-Basic (bearer / clé d'API / cookie / OAuth2 /
+    // mTLS), telle quelle depuis monitors.auth_config. Gardée en Value brut
+    // comme llm_config : sa forme dépend du mode, et un agent qui ne
+    // connaîtrait pas encore un mode ne doit pas faire échouer tout le lot
+    // de tâches à la désérialisation. Parsée par auth.rs.
+    #[serde(default)]
+    pub auth_config: Option<Value>,
     #[serde(default)]
     pub keyword: Option<String>,
     #[serde(default)]
@@ -71,6 +78,17 @@ pub struct CheckTask {
     // after connecting. None = the type's default (SELECT 1 / { ping: 1 }).
     #[serde(default)]
     pub db_query: Option<String>,
+    // OKS-708 — set on a one-shot test from the dashboard's Test button (only
+    // handed to agents that send X-Agent-Capabilities: test-tasks). The
+    // result goes to /internal/test-results right away, never into the
+    // batched check results: a test is not a check and must leave no trace.
+    #[serde(default)]
+    pub test_id: Option<String>,
+    // OKS-880 — the secret fields above (headers, body, Basic auth,
+    // auth_config, LLM key) sealed for this agent; seal::open puts them back
+    // before the check runs. Absent while the backend sends them in clear.
+    #[serde(default)]
+    pub sealed: Option<crate::seal::SealedEnvelope>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -87,6 +105,11 @@ pub enum CheckType {
     Postgres,
     Mysql,
     Mongodb,
+    // Services applicatifs parlés en direct sur le socket (checks/smtp.rs,
+    // imap.rs, redis.rs) : identifiants dans basic_auth_user/pass.
+    Smtp,
+    Imap,
+    Redis,
     // Catch-all for any check_type the aggregator sends that this build
     // doesn't know about yet (e.g. a new check type shipped server-side
     // before this agent image was rebuilt/redeployed). Without this,
@@ -162,6 +185,17 @@ mod tests {
         assert_eq!(parsed.tasks[0].check_type, CheckType::Http);
         assert_eq!(parsed.tasks[1].check_type, CheckType::Unknown);
         assert_eq!(parsed.tasks[2].check_type, CheckType::Ping);
+    }
+
+    #[test]
+    fn a_test_task_carries_its_test_id_and_a_normal_task_does_not() {
+        let body = r#"{"tasks":[
+            {"taskId":"t1","monitorId":"m1","orgId":"o1","tenantId":"okstatus","target":"redis://redis.internal:6379","checkType":"redis","region":"private:a","testId":"5b1d6a52-0000-4000-a000-000000000001"},
+            {"taskId":"t2","monitorId":"m2","orgId":"o1","tenantId":"okstatus","target":"1.1.1.1","checkType":"ping","region":"private:a"}
+        ]}"#;
+        let parsed: TasksResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.tasks[0].test_id.as_deref(), Some("5b1d6a52-0000-4000-a000-000000000001"));
+        assert_eq!(parsed.tasks[1].test_id, None);
     }
 
     #[test]

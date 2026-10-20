@@ -22,6 +22,11 @@ pub async fn check_tcp(task: &CheckTask) -> CheckResult {
 
     let addr = format!("{host}:{port}");
 
+    // OKS-414 #5 — no port-scanning the network the shared agent sits in.
+    if let Err(error) = crate::ssrf::check_public_target(host, port).await {
+        return failed(task, &start, error);
+    }
+
     match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
         Ok(Ok(_)) => {
             let latency = start.elapsed().as_millis() as u64;
@@ -77,5 +82,24 @@ pub async fn check_tcp(task: &CheckTask) -> CheckResult {
             itl_ms: None,
             checked_at: chrono::Utc::now().to_rfc3339(),
         },
+    }
+}
+
+fn failed(task: &CheckTask, start: &Instant, error: String) -> CheckResult {
+    CheckResult {
+        task_id: task.task_id.clone(),
+        monitor_id: task.monitor_id.clone(),
+        region: task.region.clone(),
+        agent_type: String::new(),
+        success: false,
+        latency_ms: Some(start.elapsed().as_millis() as u64),
+        status_code: None,
+        ssl_days_left: None,
+        error: Some(error),
+        state: None,
+        ttft_ms: None,
+        tpot_ms: None,
+        itl_ms: None,
+        checked_at: chrono::Utc::now().to_rfc3339(),
     }
 }

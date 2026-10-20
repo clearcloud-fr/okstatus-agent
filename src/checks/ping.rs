@@ -28,6 +28,12 @@ pub async fn check_ping(task: &CheckTask) -> CheckResult {
 
     let host = extract_host(&task.target);
 
+    // OKS-414 #5 — same guard as tcp/http: names and addresses of the network
+    // this agent runs in are not pingable from a shared fleet agent.
+    if let Err(error) = crate::ssrf::check_public_target(host, 0).await {
+        return error_result(task, &start, error);
+    }
+
     // Resolve hostname to IP
     let ip: IpAddr = match tokio::net::lookup_host(format!("{host}:0")).await {
         Ok(mut addrs) => match addrs.next() {

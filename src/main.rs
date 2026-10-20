@@ -1,3 +1,5 @@
+mod host_info;
+mod auth;
 mod checks;
 mod circuit_breaker;
 mod config;
@@ -5,6 +7,7 @@ mod enroll;
 mod metrics;
 mod models;
 mod results;
+mod seal;
 mod ssrf;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -60,14 +63,31 @@ struct HealthResponse {
     last_result_at: Option<String>,
 }
 
+/// rustls 0.23 picks its crypto provider from crate features, and this agent
+/// enables two of them (`ring` through tonic, `aws-lc-rs` through the AWS SDK
+/// used by Bedrock checks). Faced with both it refuses to choose and PANICS
+/// at the first handshake that relies on the process default — every gRPC
+/// check over TLS (grpcs://, or :443) died inside its task, no result was
+/// ever posted, and the monitor went silently `stale` (2026-09-14).
+/// Installing one explicitly settles it; a second call is a harmless no-op.
+fn install_tls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[tokio::main]
 async fn main() {
+    install_tls_crypto_provider();
     let mut config = Config::from_env();
     // OKS-401 — private-agent bootstrap: exchanges OKSTATUS_TOKEN for
     // per-agent credentials (or loads persisted ones) and flips the config
     // into private mode. Fleet agents fall straight through.
     let private_mode = enroll::bootstrap(&mut config).await;
     let config = config;
+    // OKS-880 — identified agents (fleet or private) derive their seal key
+    // from their secret; its public half goes out with every heartbeat.
+    if config.agent_id.is_some() {
+        seal::init(&config.agent_secret);
+    }
     // OKS-355 — APP_VERSION is stamped by the Docker build (= image tag);
     // an unset OR empty value falls back to the Cargo package version, which
     // the same build also rewrites, so both paths agree.
@@ -86,6 +106,8 @@ async fn main() {
     println!("  Agent type:          {}", config.agent_type);
     if private_mode {
         println!("  Private mode:        enrolled as {}", config.agent_id.as_deref().unwrap_or("?"));
+    } else if let Some(id) = &config.agent_id {
+        println!("  Fleet identity:      {}", id);
     }
     println!("  Aggregator URL:      {}", config.aggregator_url);
     println!("  Poll interval:       {}ms", config.poll_interval_ms);
@@ -159,6 +181,7 @@ async fn main() {
     let check_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(false)
         .redirect(reqwest::redirect::Policy::none()) // Anti-SSRF (UPT-48)
+        .dns_resolver(std::sync::Arc::new(ssrf::GuardedResolver)) // Anti-SSRF, DNS rebinding (F7)
         .build()
         .expect("failed to build check HTTP client");
 
@@ -167,6 +190,13 @@ async fn main() {
     let hb_config = config.clone();
     let hb_state = state.clone();
     let hb_version = version.clone();
+    // 2026-10-03 — private agents page v2: where the agent runs (platform,
+    // start time; host and private IP are read on each beat).
+    let hb_started_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let hb_platform = host_info::platform();
     tokio::spawn(async move {
         // Small initial delay so the first poll cycle can establish connectivity
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -186,13 +216,26 @@ async fn main() {
                 "region": hb_config.region,
                 "agentType": hb_config.agent_type,
                 // Private mode: the enrolled id (the backend keys heartbeats
-                // on it); fleet mode keeps the hostname.
-                "agentId": hb_config.agent_id.as_deref().unwrap_or(&hostname),
+                // on it); fleet mode keeps the hostname, identified or not
+                // (OKS-873: the admin agent list shows it).
+                "agentId": if hb_config.agent_type == "private" {
+                    hb_config.agent_id.as_deref().unwrap_or(&hostname)
+                } else {
+                    &hostname
+                },
                 "version": hb_version,
                 "checksLast1h": checks_completed,
                 "activeChecks": active_checks,
                 "maxConcurrentChecks": hb_config.max_concurrent_checks,
+                "hostname": hostname,
+                "privateIp": host_info::private_ip(&hb_config.aggregator_url),
+                "platform": hb_platform,
+                "startedAt": hb_started_at_ms,
             });
+            let mut payload = payload;
+            if let Some(key) = seal::public_key() {
+                payload["sealPublicKey"] = serde_json::Value::from(key);
+            }
 
             let mut req = hb_client
                 .post(&url)
@@ -342,7 +385,7 @@ async fn main() {
 
         metrics::POLL_CYCLES_TOTAL.inc();
 
-        match poll_and_execute(
+        let full_batch = match poll_and_execute(
             &client,
             &check_client,
             &config,
@@ -374,6 +417,8 @@ async fn main() {
                         "Tasks received — executing checks"
                     );
                 }
+
+                count >= FULL_BATCH_THRESHOLD
             }
             Err(e) => {
                 state.circuit_breaker.record_failure().await;
@@ -388,11 +433,28 @@ async fn main() {
                     aggregator = %config.aggregator_url,
                     "Poll cycle failed"
                 );
+
+                false
             }
-        }
+        };
+
+        // OKS-759 — un lot plein veut dire « la file a plus de travail que ce
+        // qu'un poll en rapporte » : on repart tout de suite au lieu de dormir
+        // POLL_INTERVAL_MS. Sans ça, le débit d'une région était plafonné à
+        // un lot par intervalle — 50 tâches / 10 s ≈ 300 checks/min — quoi
+        // qu'encaisse le backend. Mesuré le 2026-09-11 : 400 checks/min
+        // demandés sur fr-dc3, 306 servis, et un retard qui montait de 18 s
+        // par minute sans jamais se résorber (backend à 8 % de CPU).
+        //
+        // Rien ne s'emballe : `poll_and_execute` acquiert un permis du
+        // sémaphore AVANT de lancer chaque check, donc dès que
+        // MAX_CONCURRENT_CHECKS est atteint la boucle attend là. Le palier de
+        // 100 ms borne malgré tout le cas dégénéré (lots pleins servis
+        // instantanément) à ~10 polls/s par région.
+        let next_poll = next_poll_delay(full_batch, config.poll_interval_ms);
 
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(config.poll_interval_ms)) => {}
+            _ = tokio::time::sleep(next_poll) => {}
             _ = shutdown.notified() => {
                 info!("Shutdown requested — draining in-flight checks, then exiting");
                 break;
@@ -466,6 +528,11 @@ async fn poll_and_execute(
     if let Some(id) = &config.agent_id {
         req = req.header("X-Agent-Id", id);
         req = req.header("X-Agent-Instance", &config.instance_id);
+        // OKS-708 — this build can run one-shot tests from the dashboard
+        // (private agents only; OKS-873 fleet identities have an id too).
+        if config.agent_type == "private" {
+            req = req.header("X-Agent-Capabilities", "test-tasks");
+        }
     }
     let resp = req.send().await?;
 
@@ -504,7 +571,20 @@ async fn poll_and_execute(
     // 2. Spawn checks into the shared JoinSet — bounded by the semaphore,
     // not awaited here (OKS-415): the poll loop keeps polling while checks
     // run, and the shutdown path drains the JoinSet.
-    for task in tasks_resp.tasks {
+    for mut task in tasks_resp.tasks {
+        // OKS-880 — secrets sealed for this agent: opened in memory here. A
+        // task we cannot open is skipped, never run without its credentials
+        // (that would report a false outage, e.g. 401).
+        if let Err(e) = seal::open(config.agent_id.as_deref(), &mut task) {
+            error!(
+                task_id = %task.task_id,
+                monitor_id = %task.monitor_id,
+                error = %e,
+                "Skipping task: sealed secrets unreadable"
+            );
+            metrics::SEALED_TASKS_UNREADABLE.inc();
+            continue;
+        }
         // Task already deserialized fine (CheckType::Unknown is serde's
         // catch-all for a check_type string this build doesn't recognize —
         // see models.rs), but there's no handler to run it with. Skip
@@ -526,6 +606,35 @@ async fn poll_and_execute(
         let task_state = state.clone();
         let tx = result_tx.clone();
         let jitter_ms = config.check_start_jitter_ms;
+
+        // OKS-708 — a test answers straight to the waiting dashboard request:
+        // no jitter, no batch, no metrics, no stored result.
+        if let Some(test_id) = task.test_id.clone() {
+            let client = client.clone();
+            let aggregator_url = config.aggregator_url.clone();
+            let agent_secret = config.agent_secret.clone();
+            let agent_id = config.agent_id.clone();
+            let instance_id = config.instance_id.clone();
+            check_tasks.spawn(async move {
+                let result = execute_check(&check_client, &task).await;
+                if let Err(e) = results::post_test_result(
+                    &client,
+                    &aggregator_url,
+                    &agent_secret,
+                    agent_id.as_deref(),
+                    &instance_id,
+                    &test_id,
+                    &result,
+                )
+                .await
+                {
+                    warn!(test_id = %test_id, error = %e, "Test result not delivered");
+                }
+                task_state.active_checks.fetch_sub(1, Ordering::Relaxed);
+                drop(permit);
+            });
+            continue;
+        }
 
         check_tasks.spawn(async move {
             // Start jitter (OKS-415 follow-up) — without it every check of
@@ -556,6 +665,9 @@ async fn poll_and_execute(
                 CheckType::Postgres => "postgres",
                 CheckType::Mysql => "mysql",
                 CheckType::Mongodb => "mongodb",
+                CheckType::Smtp => "smtp",
+                CheckType::Imap => "imap",
+                CheckType::Redis => "redis",
                 // Unreachable in practice — the outer loop `continue`s past
                 // CheckType::Unknown before spawning this task at all.
                 CheckType::Unknown => "unknown",
@@ -585,6 +697,19 @@ async fn poll_and_execute(
 }
 
 async fn execute_check(client: &reqwest::Client, task: &CheckTask) -> CheckResult {
+    let mut result = dispatch_check(client, task).await;
+    // Dernier filet AVANT que le message ne parte vers l'agrégateur : une
+    // erreur de transport cite volontiers l'URL complète, clé d'API en
+    // paramètre comprise ; un serveur bavard renvoie l'identifiant refusé.
+    // Le champ `error` finit dans check_results, l'historique d'événements,
+    // les alertes et les exports — il ne doit porter aucun secret.
+    if let Some(error) = result.error.take() {
+        result.error = Some(crate::auth::scrub_secrets(&error, task));
+    }
+    result
+}
+
+async fn dispatch_check(client: &reqwest::Client, task: &CheckTask) -> CheckResult {
     match task.check_type {
         CheckType::Http => checks::http::check_http(client, task).await,
         CheckType::Ping => checks::ping::check_ping(task).await,
@@ -594,6 +719,9 @@ async fn execute_check(client: &reqwest::Client, task: &CheckTask) -> CheckResul
         CheckType::Grpc => checks::grpc::check_grpc(task).await,
         // OKS-668 — one handler for the three database dialects.
         CheckType::Postgres | CheckType::Mysql | CheckType::Mongodb => checks::db::check_db(task).await,
+        CheckType::Smtp | CheckType::Imap | CheckType::Redis => {
+            checks::service::check_service(task).await
+        }
         // The poll loop `continue`s past CheckType::Unknown before this is
         // ever called (see poll_and_execute) — there's no handler to run an
         // unrecognized check type with.
@@ -601,3 +729,69 @@ async fn execute_check(client: &reqwest::Client, task: &CheckTask) -> CheckResul
     }
 }
 
+/// OKS-759 — un poll qui revient PLEIN signifie que la file de la région a
+/// plus de travail qu'un seul poll n'en rapporte. `/internal/tasks` en rend
+/// 50 au plus (51 en pratique : la borne de fin est inclusive côté BullMQ),
+/// donc à partir de ce seuil le lot est considéré plein.
+const FULL_BATCH_THRESHOLD: usize = 50;
+
+/// Palier de sécurité pour le cas dégénéré (des lots pleins servis
+/// instantanément) : ~10 polls/s par région au maximum.
+const FULL_BATCH_REPOLL_DELAY_MS: u64 = 100;
+
+/// OKS-759 — combien de temps attendre avant le prochain poll.
+///
+/// Un lot plein veut dire que la file de la région a plus de travail qu'un
+/// poll n'en rapporte : on repart presque tout de suite, au lieu d'attendre
+/// l'intervalle complet. Sans ça le débit d'une région était plafonné à un
+/// lot par intervalle (50 tâches / 10 s ≈ 300 checks/min) quoi qu'encaisse le
+/// backend, et le retard des checks grimpait sans jamais se résorber.
+fn next_poll_delay(full_batch: bool, poll_interval_ms: u64) -> Duration {
+    if full_batch {
+        Duration::from_millis(FULL_BATCH_REPOLL_DELAY_MS)
+    } else {
+        Duration::from_millis(poll_interval_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Régression OKS-759 : mesuré en charge le 2026-09-11 — 400 checks/min
+    // demandés sur une région, 306 servis, et un retard qui montait de 18 s
+    // par minute. La cause était ce sommeil inconditionnel après un lot plein.
+    #[test]
+    fn repolls_almost_immediately_after_a_full_batch() {
+        let delay = next_poll_delay(true, 10_000);
+        assert_eq!(delay, Duration::from_millis(FULL_BATCH_REPOLL_DELAY_MS));
+        assert!(
+            delay < Duration::from_millis(10_000),
+            "un lot plein ne doit pas attendre l'intervalle de poll"
+        );
+    }
+
+    // Le cas nominal ne change pas : file vide ou partiellement servie, on
+    // attend l'intervalle configuré (sinon l'agent interrogerait le backend
+    // en boucle pour rien).
+    #[test]
+    fn keeps_the_configured_interval_when_the_batch_is_not_full() {
+        assert_eq!(next_poll_delay(false, 10_000), Duration::from_millis(10_000));
+        assert_eq!(next_poll_delay(false, 2_500), Duration::from_millis(2_500));
+    }
+}
+
+
+#[cfg(test)]
+mod tls_provider_tests {
+    // Without install_tls_crypto_provider() this panics with "Could not
+    // automatically determine the process-level CryptoProvider" — exactly
+    // what every TLS gRPC check hit in production.
+    #[test]
+    fn rustls_client_config_builds_once_the_provider_is_installed() {
+        super::install_tls_crypto_provider();
+        let _ = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    }
+}

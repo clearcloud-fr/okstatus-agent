@@ -56,6 +56,16 @@ pub static TASKS_RECEIVED_TOTAL: LazyLock<Counter> = LazyLock::new(|| {
     .expect("failed to register tasks_received_total")
 });
 
+// OKS-880 — tasks skipped because their sealed secrets could not be opened
+// (key mismatch after a secret rotation, tampered task). Should stay at 0.
+pub static SEALED_TASKS_UNREADABLE: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "uptime_agent_sealed_tasks_unreadable_total",
+        "Tasks skipped because their sealed secrets could not be opened"
+    )
+    .expect("failed to register sealed_tasks_unreadable_total")
+});
+
 pub static QUEUE_DEPTH: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
         "uptime_agent_queue_depth",

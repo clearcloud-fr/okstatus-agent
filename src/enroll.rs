@@ -32,10 +32,60 @@ fn apply_private_identity(config: &mut Config, agent_id: String, agent_secret: S
     crate::ssrf::set_allow_private_targets(true);
 }
 
+fn looks_like_uuid(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// OKS-873 — identity of an agent of OUR network (not a customer agent).
+/// Only the credentials change: region, agent type and the SSRF guard stay
+/// exactly as configured (unlike `apply_private_identity`). Returns true
+/// when FLEET_AGENT_ID / FLEET_AGENT_SECRET are set and valid; exits on a
+/// misconfiguration so it shows on the first screen of logs.
+fn apply_fleet_identity(config: &mut Config) -> bool {
+    let id = std::env::var("FLEET_AGENT_ID").unwrap_or_default();
+    let secret = std::env::var("FLEET_AGENT_SECRET").unwrap_or_default();
+    if id.is_empty() && secret.is_empty() {
+        return false;
+    }
+    if id.is_empty() || secret.is_empty() {
+        eprintln!("FLEET_AGENT_ID and FLEET_AGENT_SECRET must be set together.");
+        std::process::exit(1);
+    }
+    if !looks_like_uuid(&id) {
+        eprintln!("FLEET_AGENT_ID is '{id}' — this must be the UUID printed by fleet-agent.js create.");
+        std::process::exit(1);
+    }
+    if !secret.starts_with("oksf_") {
+        eprintln!("FLEET_AGENT_SECRET must be the oksf_… secret printed by fleet-agent.js create.");
+        std::process::exit(1);
+    }
+    if std::env::var("OKSTATUS_AGENT_ID").is_ok() || std::env::var("OKSTATUS_TOKEN").is_ok() {
+        eprintln!(
+            "FLEET_AGENT_* (agent of the OKStatus network) and OKSTATUS_AGENT_ID / \
+             OKSTATUS_TOKEN (customer private agent) are mutually exclusive."
+        );
+        std::process::exit(1);
+    }
+    info!(agent_id = %id, region = %config.region, "fleet agent identity loaded from environment");
+    config.agent_id = Some(id);
+    config.agent_secret = secret;
+    true
+}
+
 /// Returns Ok(true) when the agent runs in private mode after this call.
 /// Exits the process on a rejected enrollment token — running on with no
 /// valid credentials would just hammer the API with 401s.
 pub async fn bootstrap(config: &mut Config) -> bool {
+    // OKS-873 — an agent of our network with its own identity is never a
+    // private agent: no credentials file, no enrollment.
+    if apply_fleet_identity(config) {
+        return false;
+    }
+
     let path = credentials_path();
 
     // 0. Pre-provisioned credentials straight from the environment (a Secret).
@@ -55,12 +105,7 @@ pub async fn bootstrap(config: &mut Config) -> bool {
             // enrollment token (oksa_live_…) pasted as the long-lived secret
             // (oksas_…). Exiting keeps the error on the pod's first screen
             // of logs, where a restart loop makes it impossible to miss.
-            let looks_like_uuid = id.len() == 36
-                && id.bytes().enumerate().all(|(i, b)| match i {
-                    8 | 13 | 18 | 23 => b == b'-',
-                    _ => b.is_ascii_hexdigit(),
-                });
-            if !looks_like_uuid {
+            if !looks_like_uuid(&id) {
                 eprintln!(
                     "OKSTATUS_AGENT_ID is '{id}' — this must be the agent's UUID \
                      (shown when the agent was created), not its name."
@@ -165,4 +210,16 @@ pub async fn bootstrap(config: &mut Config) -> bool {
     info!(agent_id = %body.agent_id, "private agent enrolled");
     apply_private_identity(config, body.agent_id, body.agent_secret);
     true
+}
+
+#[cfg(test)]
+mod fleet_identity_tests {
+    use super::looks_like_uuid;
+
+    #[test]
+    fn uuid_shape() {
+        assert!(looks_like_uuid("f1ee7000-1234-4abc-9def-000000000001"));
+        assert!(!looks_like_uuid("okstatus-agent-upc-es-mad"));
+        assert!(!looks_like_uuid("f1ee7000x1234-4abc-9def-000000000001"));
+    }
 }

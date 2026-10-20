@@ -220,3 +220,65 @@ async fn post_result(
 
     Err(last_err)
 }
+
+/// OKS-708 — the answer to a one-shot test, posted as soon as the check ends:
+/// a person is waiting on it in the dashboard (25 s at most), so it neither
+/// waits for the next batch flush nor goes through /internal/results, where
+/// it would be stored as a real check. Two attempts only — past a few
+/// seconds nobody is listening any more.
+pub async fn post_test_result(
+    client: &reqwest::Client,
+    aggregator_url: &str,
+    agent_secret: &str,
+    agent_id: Option<&str>,
+    instance_id: &str,
+    test_id: &str,
+    result: &CheckResult,
+) -> Result<(), String> {
+    let url = format!("{aggregator_url}/internal/test-results");
+    let body = TestResultBody {
+        test_id,
+        success: result.success,
+        latency_ms: result.latency_ms,
+        status_code: result.status_code,
+        state: result.state.as_deref(),
+        error: result.error.as_deref(),
+    };
+    let mut last_err = String::from("unknown error");
+    for attempt in 0..2u32 {
+        let mut req = client
+            .post(&url)
+            .header("X-Agent-Secret", agent_secret)
+            .header("Content-Type", "application/json");
+        if let Some(id) = agent_id {
+            req = req.header("X-Agent-Id", id).header("X-Agent-Instance", instance_id);
+        }
+        match req.json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => {
+                last_err = format!("aggregator returned HTTP {}", resp.status());
+                // 4xx (expired test, not ours): retrying changes nothing.
+                if resp.status().is_client_error() {
+                    break;
+                }
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+        if attempt == 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    Err(last_err)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TestResultBody<'a> {
+    test_id: &'a str,
+    success: bool,
+    latency_ms: Option<u64>,
+    status_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+    error: Option<&'a str>,
+}

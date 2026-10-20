@@ -18,6 +18,8 @@
 
 use std::time::{Duration, Instant};
 
+use base64::Engine;
+
 use tonic::transport::{ClientTlsConfig, Endpoint};
 use tonic::Code;
 use tonic_health::pb::health_check_response::ServingStatus;
@@ -26,10 +28,69 @@ use tonic_health::pb::HealthCheckRequest;
 
 use crate::models::{CheckResult, CheckTask};
 
+/// Pose sur la requête les en-têtes d'authentification du monitor.
+///
+/// Seuls les modes « statiques » ont un sens ici : OAuth2 demanderait une
+/// requête HTTP séparée (le jeton se réclame à un token endpoint, pas au
+/// service gRPC) et mTLS se règle sur le canal, pas sur la requête — les
+/// deux sont refusés explicitement plutôt que silencieusement ignorés, pour
+/// qu'un monitor mal configuré le dise au lieu de renvoyer un
+/// UNAUTHENTICATED incompréhensible.
+fn apply_metadata(
+    metadata: &mut tonic::metadata::MetadataMap,
+    task: &CheckTask,
+) -> Result<(), String> {
+    use tonic::metadata::{MetadataKey, MetadataValue};
+
+    let mut insert = |name: &str, value: &str| -> Result<(), String> {
+        let key = MetadataKey::from_bytes(name.to_ascii_lowercase().as_bytes())
+            .map_err(|_| format!("invalid metadata name '{name}'"))?;
+        let value = MetadataValue::try_from(value)
+            .map_err(|_| format!("invalid metadata value for '{name}'"))?;
+        metadata.insert(key, value);
+        Ok(())
+    };
+
+    if let Some(ref custom) = task.http_headers {
+        for (name, value) in custom {
+            insert(name, value)?;
+        }
+    }
+
+    if let (Some(user), Some(pass)) = (&task.basic_auth_user, &task.basic_auth_pass) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        insert("authorization", &format!("Basic {encoded}"))?;
+    }
+
+    match crate::auth::parse(task.auth_config.as_ref()) {
+        Some(crate::auth::MonitorAuth::Bearer(b)) => insert("authorization", &format!("Bearer {}", b.token))?,
+        Some(crate::auth::MonitorAuth::Apikey(k)) => {
+            if k.location == "query" {
+                return Err(
+                    "an API key in a query parameter has no equivalent in gRPC — use the header form".into(),
+                );
+            }
+            insert(&k.name, &k.value)?
+        }
+        Some(crate::auth::MonitorAuth::Cookie(c)) => insert("cookie", &c.cookie)?,
+        Some(crate::auth::MonitorAuth::Oauth2(_)) => {
+            return Err("OAuth2 authentication is not supported for gRPC monitors yet".into())
+        }
+        Some(crate::auth::MonitorAuth::Mtls(_)) => {
+            return Err("mTLS is not supported for gRPC monitors yet".into())
+        }
+        None => {}
+    }
+
+    Ok(())
+}
+
 struct GrpcTarget {
     uri: String,
     tls: bool,
     service: String,
+    host: String,
+    port: u16,
 }
 
 fn parse_target(raw: &str) -> Result<GrpcTarget, String> {
@@ -67,7 +128,17 @@ fn parse_target(raw: &str) -> Result<GrpcTarget, String> {
         )
     };
 
-    Ok(GrpcTarget { uri, tls, service })
+    // Host without the port (and without IPv6 brackets) for the SSRF guard.
+    let host = match authority.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => h,
+        _ => authority,
+    }
+    .trim_start_matches('[')
+    .trim_end_matches(']')
+    .to_string();
+    let port = port.unwrap_or(if tls { 443 } else { 80 });
+
+    Ok(GrpcTarget { uri, tls, service, host, port })
 }
 
 pub async fn check_grpc(task: &CheckTask) -> CheckResult {
@@ -78,6 +149,13 @@ pub async fn check_grpc(task: &CheckTask) -> CheckResult {
         Ok(t) => t,
         Err(e) => return result(task, &start, false, None, Some(e)),
     };
+
+    // Revue sécurité 2026-09-14 (F4) — the one check that skipped the guard
+    // every other check runs: a public name pointed at 10.x:4317 (OTel
+    // collector) or any internal gRPC service was probed from the fleet.
+    if let Err(e) = crate::ssrf::check_public_target(&target.host, target.port).await {
+        return result(task, &start, false, None, Some(e));
+    }
 
     let endpoint = match Endpoint::from_shared(target.uri.clone()) {
         Ok(e) => e,
@@ -98,7 +176,16 @@ pub async fn check_grpc(task: &CheckTask) -> CheckResult {
     };
 
     let mut client = HealthClient::new(channel);
-    let request = HealthCheckRequest { service: target.service.clone() };
+    let mut request = tonic::Request::new(HealthCheckRequest { service: target.service.clone() });
+
+    // Métadonnées d'authentification. Une API gRPC derrière une passerelle
+    // attend le même `authorization` (ou la même clé d'API) qu'une API REST :
+    // sans ça, un service parfaitement sain répond UNAUTHENTICATED et le
+    // monitor le compte comme une panne. Les en-têtes personnalisés du
+    // monitor passent aussi, en métadonnées.
+    if let Err(e) = apply_metadata(request.metadata_mut(), task) {
+        return result(task, &start, false, None, Some(e));
+    }
 
     match tokio::time::timeout(timeout, client.check(request)).await {
         Ok(Ok(resp)) => {
@@ -170,6 +257,7 @@ mod tests {
     #[test]
     fn parses_bare_host_port_as_plaintext() {
         let t = parse_target("api.internal:50051").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("api.internal", 50051));
         assert_eq!(t.uri, "http://api.internal:50051");
         assert!(!t.tls);
         assert_eq!(t.service, "");
@@ -199,6 +287,11 @@ mod tests {
     #[test]
     fn unsupported_scheme_is_rejected() {
         assert!(parse_target("ftp://api.example.com:21").is_err());
+        // F4 — host/port feed the SSRF guard: default port by scheme, IPv6 unbracketed.
+        let t = parse_target("grpcs://api.example.com").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("api.example.com", 443));
+        let t = parse_target("grpc://[::1]:50051").unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("::1", 50051));
         assert!(parse_target("grpcs://").is_err());
     }
 }

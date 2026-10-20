@@ -7,9 +7,10 @@ pub struct Config {
     pub agent_type: String,  // 'k8s', 'vps' or 'private' (OKS-401)
     pub aggregator_url: String,
     pub agent_secret: String,
-    // OKS-401 — set after enrollment (enroll.rs); Some = private mode, and
-    // every /internal/* request then carries X-Agent-Id alongside the
-    // per-agent X-Agent-Secret.
+    // OKS-401 — set after enrollment (enroll.rs) for a private agent, or from
+    // FLEET_AGENT_ID for an identified agent of our network (OKS-873; then
+    // agent_type stays k8s/vps). Some = every /internal/* request carries
+    // X-Agent-Id alongside the per-agent X-Agent-Secret.
     pub agent_id: Option<String>,
     // OKS-401 — unique id for THIS running process, sent as X-Agent-Instance
     // on every /internal/* call in private mode. The backend's single-instance

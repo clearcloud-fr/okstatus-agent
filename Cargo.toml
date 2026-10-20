@@ -22,19 +22,36 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tokio-native-tls = "0.3"
 native-tls = "0.2"
 x509-parser = "0.16"
-prometheus = "0.13"
+prometheus = "0.14"
 base64 = "0.22"
-hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+hickory-resolver = { version = "0.26", features = ["tokio"] }
 hostname = "0.4"
 # OKS-169 — LLM canary checks (checks/llm.rs)
 futures-util = "0.3"
 regex = "1"
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-bedrockruntime = "1"
+# Revue sécurité 2026-09-14 — sans `default-features = false`, la feature
+# `rustls` du SDK tire le client legacy (hyper 0.14 + rustls 0.21 + h2 0.3,
+# plusieurs RUSTSEC). `default-https-client` = hyper 1 + rustls 0.23 aws-lc.
+# Pas de `sso` ni `credentials-process` : le check LLM passe des identifiants
+# statiques (llm.rs).
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # OKS-474 — gRPC health checks (checks/grpc.rs): standard grpc.health.v1
 # Health/Check via tonic; tonic-health ships the generated client stubs.
-tonic = { version = "0.12", features = ["tls", "tls-roots"] }
-tonic-health = "0.12"
+# Revue sécurité 2026-09-15 — tonic 0.14 : plus de rustls-pemfile (RUSTSEC-2025-0134,
+# crate abandonnée) ; la feature `tls` est devenue `tls-ring` (même backend
+# que le reste de l'agent) et `tls-roots` → `tls-native-roots`.
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic-health = "0.14"
+# Already in the tree (tonic → ring, aws-sdk → aws-lc-rs); declared directly
+# only to call CryptoProvider::install_default() in main.rs — with both
+# providers enabled rustls cannot pick one and every TLS gRPC check panicked.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# OKS-880 — secrets des monitors chiffrés pour l'agent (src/seal.rs) : X25519
+# à clé fixe, HKDF et ChaCha20-Poly1305. aws-lc-rs est déjà dans l'arbre (SDK
+# AWS) — ring n'a que des clés X25519 éphémères. zeroize : idem, déjà tiré.
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys"] }
+zeroize = "1"
 surge-ping = "0.8"
 tokio-postgres = "0.7.18"
 postgres-native-tls = "0.5.3"

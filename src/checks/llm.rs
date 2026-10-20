@@ -24,6 +24,10 @@ use serde_json::Value;
 
 use crate::models::{CheckResult, CheckTask};
 
+/// OKS-414 #13 — bounds on what one LLM check keeps in memory.
+const SSE_BUFFER_CAP_BYTES: usize = 1_048_576;
+const CONTENT_CAP_BYTES: usize = 1_048_576;
+
 #[derive(Deserialize)]
 struct LlmTimeouts {
     connect_ms: u64,
@@ -140,6 +144,19 @@ pub async fn check_llm(client: &reqwest::Client, task: &CheckTask) -> CheckResul
     let connect_timeout = Duration::from_millis(config.timeouts.connect_ms);
     let first_token_timeout = Duration::from_millis(config.timeouts.first_token_ms);
     let total_timeout = Duration::from_millis(config.timeouts.total_ms);
+
+    // OKS-414 #2 — the HTTP providers post to a customer-supplied URL; the
+    // same private-address guard as http.rs applies (bedrock goes through
+    // the AWS SDK to a fixed regional endpoint, nothing to vet).
+    if provider != "bedrock" {
+        if let Ok(url) = reqwest::Url::parse(&task.target) {
+            let host = url.host_str().unwrap_or_default().to_string();
+            let port = url.port_or_known_default().unwrap_or(443);
+            if let Err(error) = crate::ssrf::check_public_target(&host, port).await {
+                return error_result(task, &start, error, CheckState::Down);
+            }
+        }
+    }
 
     let outcome = match provider {
         "anthropic" => {
@@ -381,6 +398,13 @@ where
         };
 
         buffer.push_str(&String::from_utf8_lossy(&next));
+        // OKS-414 #13 — a stream that never sends a frame terminator would
+        // otherwise grow this buffer until the check's total timeout.
+        if buffer.len() > SSE_BUFFER_CAP_BYTES {
+            return Err(SendError::Other(format!(
+                "SSE frame exceeds {SSE_BUFFER_CAP_BYTES} bytes without a terminator"
+            )));
+        }
 
         while let Some(pos) = buffer.find("\n\n") {
             let frame = buffer[..pos].to_string();
@@ -405,7 +429,7 @@ where
                             ttft_ms = Some(elapsed.as_millis() as u64);
                         }
                         token_times.push(elapsed);
-                        if is_content {
+                        if is_content && content.len() < CONTENT_CAP_BYTES {
                             content.push_str(text);
                         }
                     }
@@ -667,7 +691,9 @@ async fn send_bedrock(
                         ttft_ms = Some(elapsed.as_millis() as u64);
                     }
                     token_times.push(elapsed);
-                    content.push_str(&text);
+                    if content.len() < CONTENT_CAP_BYTES {
+                        content.push_str(&text);
+                    }
                 }
             }
         }
