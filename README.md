@@ -19,12 +19,16 @@ Generate an enrollment token from **Dashboard → Private Agents → Add agent**
 ### Linux (systemd)
 
 ```sh
-curl -fsSL https://get.okstatus.eu/agent/install.sh | sudo bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/Clearcloud-Fr/okstatus-agent/main/packaging/install.sh | sudo bash -s -- \
   --token oksa_live_xxxx --name dc-paris-01
 ```
 
-Installs `/usr/local/bin/okstatus-agent`, a hardened `okstatus-agent`
-systemd unit and `/etc/okstatus-agent/okstatus-agent.env`. Logs:
+Downloads the latest release binary, checks it against the release's
+`SHA256SUMS` (nothing is installed on a mismatch), and installs
+`/usr/local/bin/okstatus-agent`, a hardened `okstatus-agent` systemd unit and
+`/etc/okstatus-agent/okstatus-agent.env` (root only: systemd reads it, the
+agent cannot change it). `--version v1.1.0` pins a release;
+`--binary-url <url> --sha256 <sum>` installs from a mirror. Logs:
 `journalctl -u okstatus-agent -f`.
 
 ### Docker
@@ -67,6 +71,7 @@ Download from [Releases](https://github.com/Clearcloud-Fr/okstatus-agent/release
 | `HEALTH_PORT` | `9091` | `/health` + `/metrics` port |
 | `RUST_LOG` | `info` | Log level |
 | `HTTPS_PROXY` | — | Egress proxy |
+| `OKSTATUS_ALLOW_CLOUD_METADATA` | `false` | Let checks reach the cloud metadata endpoints (see below) |
 
 Identity: either the stateless pair (survives any restart, nothing written
 to disk) or a token exchanged on first start. One identity = one running
@@ -79,6 +84,13 @@ instance; deploy more agents from the dashboard for HA.
   targets you configured on the dashboard.
 - Private IP ranges are allowed as targets **only** in private-agent mode
   (the public fleet refuses them).
+- Even in private-agent mode, the cloud metadata endpoints
+  (`169.254.169.254`, `169.254.170.2`, `fd00:ec2::254`, `100.100.100.200`,
+  `metadata.google.internal`) are refused, so a monitor cannot read the
+  credentials of the machine the agent runs on. Set
+  `OKSTATUS_ALLOW_CLOUD_METADATA=true` only if you monitor that endpoint.
+- The container image runs as uid 1001 on a distroless base; the Helm chart
+  passes the Kubernetes `restricted` Pod Security Standard.
 - systemd unit runs unprivileged with `ProtectSystem=strict`,
   `NoNewPrivileges`, capability set empty.
 

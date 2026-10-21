@@ -19,11 +19,20 @@
 # `minimal-rust` feature (flate2's pure-Rust backend) rather than `minimal`,
 # which despite the name links C zlib. A binary built from a tree predating that
 # change will fail here with "libz.so.1: cannot open shared object file".
+# The credentials directory must exist in the image, owned by the agent's uid:
+# a Docker named volume mounted there (the `docker run -v` of the dashboard)
+# copies its ownership, otherwise the volume is root-owned and token mode
+# cannot save the credentials it enrolls. Built on the build platform so the
+# arm64 job needs no emulation for one mkdir.
+FROM --platform=$BUILDPLATFORM busybox:1.37 AS dirs
+RUN mkdir -p /out/var/lib/okstatus-agent
+
 FROM gcr.io/distroless/cc-debian12
 ARG TARGETARCH
 ARG APP_VERSION=""
 ENV APP_VERSION=$APP_VERSION
 COPY dist/okstatus-agent-linux-${TARGETARCH} /usr/local/bin/okstatus-agent
+COPY --from=dirs --chown=1001:1001 /out/var/lib/okstatus-agent /var/lib/okstatus-agent
 # Numeric form: distroless has no useradd, and the binary needs no passwd entry.
 USER 1001:1001
 EXPOSE 9091

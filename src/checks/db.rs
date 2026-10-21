@@ -286,10 +286,21 @@ fn evaluate(task: &CheckTask, value: &QueryValue) -> Option<String> {
 }
 
 /// Anti-SSRF for the seed list: every host is resolved and refused if any
-/// address is private — unless this is a customer's private agent (OKS-401).
+/// address is private — unless this is a customer's private agent (OKS-401),
+/// which only refuses the cloud metadata endpoints.
 /// `mongodb+srv` hosts are expanded through their SRV record first.
 async fn ensure_public(dsn: &Dsn, default_port: u16) -> Result<(), String> {
     if crate::ssrf::allow_private_targets() {
+        for (host, port) in &dsn.hosts {
+            if crate::ssrf::is_blocked_hostname(host) {
+                return Err(format!("Target {host} is a cloud metadata address"));
+            }
+            if let Ok(addrs) = tokio::net::lookup_host((host.as_str(), port.unwrap_or(default_port))).await {
+                if addrs.into_iter().any(|a| crate::ssrf::is_blocked_ip(&a.ip())) {
+                    return Err(format!("Target {host} resolves to a cloud metadata address"));
+                }
+            }
+        }
         return Ok(());
     }
     let mut targets: Vec<(String, u16)> = Vec::new();

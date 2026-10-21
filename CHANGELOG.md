@@ -16,6 +16,13 @@ follow the GitHub release tags (`vX.Y.Z`).
 - SMTP, IMAP and Redis checks.
 - The heartbeat reports where the agent runs (hostname, private IP,
   platform), shown on the Private Agents page.
+- Private-agent mode still refuses the cloud metadata endpoints
+  (`169.254.169.254` and equivalents); `OKSTATUS_ALLOW_CLOUD_METADATA=true`
+  lifts it.
+- Image: `/var/lib/okstatus-agent` now exists and belongs to uid 1001, so a
+  Docker named volume mounted there is writable in token mode.
+- `install.sh` verifies the binary against `SHA256SUMS`, accepts
+  `--version`, and keeps its env file readable by root only.
 
 ## v1.0.0 — 2026-09-04
 

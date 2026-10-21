@@ -118,17 +118,17 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
     // first hop. The backend only vets the literal hostname at creation time;
     // a public name pointed at 10.x afterwards (or resolving differently from
     // inside our network) reached this request unchecked.
-    if !crate::ssrf::allow_private_targets() {
-        if let Ok(url) = reqwest::Url::parse(&current_target) {
-            let host = url.host_str().unwrap_or_default().to_string();
-            let port = url.port_or_known_default().unwrap_or(443);
-            if crate::ssrf::is_private_hostname(&host) {
-                return error_result(task, &start, format!("Target is a private address: {host}"));
-            }
-            if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
-                if addrs.into_iter().any(|a| crate::ssrf::is_private_ip(&a.ip())) {
-                    return error_result(task, &start, format!("Target resolves to a private address: {host}"));
-                }
+    // Private mode only keeps the cloud metadata endpoints out (ssrf::is_blocked_*);
+    // an IP literal never reaches GuardedResolver, so this check is the one that counts.
+    if let Ok(url) = reqwest::Url::parse(&current_target) {
+        let host = url.host_str().unwrap_or_default().to_string();
+        let port = url.port_or_known_default().unwrap_or(443);
+        if crate::ssrf::is_blocked_hostname(&host) {
+            return error_result(task, &start, format!("Target is a private address: {host}"));
+        }
+        if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
+            if addrs.into_iter().any(|a| crate::ssrf::is_blocked_ip(&a.ip())) {
+                return error_result(task, &start, format!("Target resolves to a private address: {host}"));
             }
         }
     }
@@ -198,16 +198,20 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
         // into private address space. DNS is resolved here for the guard;
         // reqwest resolves again for the actual request — the residual
         // TOCTOU window is accepted, same as the guard on DNS servers.
-        if !crate::ssrf::allow_private_targets() {
+        // Private mode: only the cloud metadata endpoints are refused.
+        {
             let host = next_url.host_str().unwrap_or_default().to_string();
             let port = next_url.port_or_known_default().unwrap_or(443);
+            if crate::ssrf::is_blocked_hostname(&host) {
+                return error_result(task, &start, format!("Redirect to private address blocked: {host}"));
+            }
             let resolved: Result<Vec<std::net::SocketAddr>, _> =
                 tokio::net::lookup_host(format!("{host}:{port}"))
                     .await
                     .map(|addrs| addrs.collect());
             match resolved {
                 Ok(addrs) => {
-                    if addrs.iter().any(|a| crate::ssrf::is_private_ip(&a.ip())) {
+                    if addrs.iter().any(|a| crate::ssrf::is_blocked_ip(&a.ip())) {
                         return error_result(
                             task,
                             &start,
@@ -215,6 +219,7 @@ pub async fn check_http(client: &reqwest::Client, task: &CheckTask) -> CheckResu
                         );
                     }
                 }
+                Err(_) if crate::ssrf::allow_private_targets() => {}
                 Err(_) => {
                     return error_result(
                         task,

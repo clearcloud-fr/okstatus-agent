@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn extract_host_handles_bare_ip_host_port_and_url() {
-        assert_eq!(extract_host("51.68.206.174"), "51.68.206.174");
+        assert_eq!(extract_host("192.0.2.10"), "192.0.2.10");
         assert_eq!(extract_host("example.com:8443"), "example.com");
         assert_eq!(extract_host("https://example.com/health"), "example.com");
         assert_eq!(extract_host("http://example.com"), "example.com");
@@ -216,8 +216,9 @@ mod tests {
     }
 }
 
-// Network-dependent, so not part of the default suite. Run with:
-//   cargo test --package uptime-agent -- --ignored icmp
+// Network-dependent, so not part of the default suite. Point it at a host
+// that answers ping but serves nothing on port 80, then run:
+//   OKS_TEST_ICMP_HOST=<ip> cargo test --package uptime-agent -- --ignored icmp
 #[cfg(test)]
 mod net_tests {
     use super::*;
@@ -225,7 +226,11 @@ mod net_tests {
     #[tokio::test]
     #[ignore]
     async fn icmp_reaches_a_host_that_serves_nothing_on_port_80() {
-        let ip: IpAddr = "51.68.206.174".parse().unwrap();
+        let Ok(host) = std::env::var("OKS_TEST_ICMP_HOST") else {
+            println!("OKS_TEST_ICMP_HOST not set, skipped");
+            return;
+        };
+        let ip: IpAddr = host.parse().expect("OKS_TEST_ICMP_HOST must be an IP address");
         match icmp_probe(ip, Duration::from_secs(5)).await {
             IcmpOutcome::Reply(rtt) => println!("ICMP reply in {rtt} ms"),
             IcmpOutcome::NoReply(r) => panic!("expected an echo reply, got: {r}"),

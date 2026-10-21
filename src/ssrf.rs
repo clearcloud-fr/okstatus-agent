@@ -2,7 +2,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // OKS-401 — private mode (customer-deployed agent inside its own network):
-// probing private IPs is the feature, so the runtime SSRF guard is lifted.
+// probing private IPs is the feature, so the runtime SSRF guard is lifted —
+// except for the cloud metadata endpoints (see ALLOW_CLOUD_METADATA).
 // Set once at startup by enroll.rs; fleet agents never touch it.
 static ALLOW_PRIVATE_TARGETS: AtomicBool = AtomicBool::new(false);
 
@@ -12,6 +13,76 @@ pub fn set_allow_private_targets(allow: bool) {
 
 pub fn allow_private_targets() -> bool {
     ALLOW_PRIVATE_TARGETS.load(Ordering::Relaxed)
+}
+
+// Private mode still refuses the cloud metadata endpoints: a monitor created
+// in the dashboard must not be able to read the instance credentials of the
+// machine the customer installed the agent on. OKSTATUS_ALLOW_CLOUD_METADATA=true
+// lifts it for the rare customer who really monitors that endpoint.
+static ALLOW_CLOUD_METADATA: AtomicBool = AtomicBool::new(false);
+
+pub fn set_allow_cloud_metadata(allow: bool) {
+    ALLOW_CLOUD_METADATA.store(allow, Ordering::Relaxed);
+}
+
+fn allow_cloud_metadata() -> bool {
+    ALLOW_CLOUD_METADATA.load(Ordering::Relaxed)
+}
+
+/// Instance metadata services: AWS/GCP/Azure/OpenStack/OVH/Scaleway
+/// (169.254.169.254), AWS ECS task credentials (169.254.170.2), AWS IPv6
+/// (fd00:ec2::254), Alibaba (100.100.100.200).
+pub fn is_cloud_metadata_ip(ip: &IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => return *v6 == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254),
+        },
+        v4 => *v4,
+    };
+    matches!(
+        ip,
+        IpAddr::V4(v4) if [[169, 254, 169, 254], [169, 254, 170, 2], [100, 100, 100, 200]].contains(&v4.octets())
+    )
+}
+
+fn is_cloud_metadata_hostname(host: &str) -> bool {
+    let h = host
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if matches!(h.as_str(), "metadata.google.internal" | "metadata" | "instance-data" | "instance-data.ec2.internal") {
+        return true;
+    }
+    h.parse::<IpAddr>().map(|ip| is_cloud_metadata_ip(&ip)).unwrap_or(false)
+}
+
+/// The address a check must refuse: every private address on a fleet agent,
+/// only the cloud metadata endpoints on a private agent.
+pub fn is_blocked_ip(ip: &IpAddr) -> bool {
+    blocked_ip(ip, allow_private_targets(), allow_cloud_metadata())
+}
+
+/// Same rule as `is_blocked_ip`, for a name checked before resolving it.
+pub fn is_blocked_hostname(host: &str) -> bool {
+    blocked_hostname(host, allow_private_targets(), allow_cloud_metadata())
+}
+
+fn blocked_ip(ip: &IpAddr, private_mode: bool, allow_metadata: bool) -> bool {
+    if private_mode {
+        !allow_metadata && is_cloud_metadata_ip(ip)
+    } else {
+        is_private_ip(ip)
+    }
+}
+
+fn blocked_hostname(host: &str, private_mode: bool, allow_metadata: bool) -> bool {
+    if private_mode {
+        !allow_metadata && is_cloud_metadata_hostname(host)
+    } else {
+        is_private_hostname(host)
+    }
 }
 
 // OKS-668 — names that only ever resolve inside a cluster or a LAN. Mirrors
@@ -100,20 +171,20 @@ pub fn is_private_ip(ip: &IpAddr) -> bool {
 /// address (a public name pointed at 10.x, or a resolver that answers
 /// differently from inside our network). Mirrors the http.rs hop guard.
 pub async fn check_public_target(host: &str, port: u16) -> Result<(), String> {
-    if allow_private_targets() {
-        return Ok(());
-    }
-    if is_private_hostname(host) {
+    if is_blocked_hostname(host) {
         return Err(format!("Target is a private address: {host}"));
     }
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     match tokio::net::lookup_host((bare, port)).await {
         Ok(addrs) => {
-            if addrs.into_iter().any(|a| is_private_ip(&a.ip())) {
+            if addrs.into_iter().any(|a| is_blocked_ip(&a.ip())) {
                 return Err(format!("Target resolves to a private address: {host}"));
             }
             Ok(())
         }
+        // Private mode used to skip the lookup altogether: a name only the
+        // check itself can resolve (its own resolver, a proxy) must keep working.
+        Err(_) if allow_private_targets() => Ok(()),
         Err(e) => Err(format!("DNS lookup error for {host}: {e}")),
     }
 }
@@ -124,20 +195,19 @@ pub async fn check_public_target(host: &str, port: u16) -> Result<(), String> {
 /// again for the request: a zone with TTL 0 could answer a public IP to the
 /// first lookup and 10.x to the second (DNS rebinding). With the guard inside
 /// the resolver there is no second lookup to race. Private mode (OKS-401)
-/// still lifts the guard, like everywhere else.
+/// lifts the guard except for the cloud metadata endpoints, like everywhere else.
 pub struct GuardedResolver;
 
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let guard = !allow_private_targets();
-            if guard && is_private_hostname(&host) {
+            if is_blocked_hostname(&host) {
                 return Err(format!("Target is a private address: {host}").into());
             }
             // The port is irrelevant for resolution; reqwest rewrites it from the URL.
             let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            if guard && addrs.iter().any(|a| is_private_ip(&a.ip())) {
+            if addrs.iter().any(|a| is_blocked_ip(&a.ip())) {
                 return Err(format!("Target resolves to a private address: {host}").into());
             }
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
@@ -228,6 +298,41 @@ mod tests {
             let name: reqwest::dns::Name = host.parse().unwrap();
             assert!(r.resolve(name).await.is_err(), "{host}");
         }
+    }
+
+    #[test]
+    fn cloud_metadata_endpoints_are_recognised() {
+        for ip in ["169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254", "::ffff:169.254.169.254"] {
+            assert!(is_cloud_metadata_ip(&ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["169.254.1.1", "10.0.0.1", "192.168.1.1", "8.8.8.8"] {
+            assert!(!is_cloud_metadata_ip(&ip.parse().unwrap()), "{ip}");
+        }
+        for h in ["metadata.google.internal", "METADATA.google.internal.", "instance-data", "169.254.169.254", "[fd00:ec2::254]"] {
+            assert!(is_cloud_metadata_hostname(h), "{h}");
+        }
+        assert!(!is_cloud_metadata_hostname("db.internal"));
+    }
+
+    // The process-wide flags are left alone: tests run in parallel and other
+    // modules assume fleet mode.
+    #[test]
+    fn private_mode_still_blocks_cloud_metadata() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        // Fleet agent: every private address.
+        assert!(blocked_ip(&ip("10.0.0.5"), false, false));
+        assert!(blocked_hostname("postgres", false, false));
+        // Private agent: the LAN is the point, metadata stays out.
+        assert!(!blocked_ip(&ip("10.0.0.5"), true, false));
+        assert!(!blocked_ip(&ip("127.0.0.1"), true, false));
+        assert!(!blocked_hostname("postgres", true, false));
+        assert!(blocked_ip(&ip("169.254.169.254"), true, false));
+        assert!(blocked_ip(&ip("::ffff:169.254.169.254"), true, false));
+        assert!(blocked_hostname("metadata.google.internal", true, false));
+        assert!(blocked_hostname("169.254.170.2", true, false));
+        // OKSTATUS_ALLOW_CLOUD_METADATA=true
+        assert!(!blocked_ip(&ip("169.254.169.254"), true, true));
+        assert!(!blocked_hostname("metadata.google.internal", true, true));
     }
 
     #[test]

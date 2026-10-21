@@ -30,6 +30,10 @@ fn apply_private_identity(config: &mut Config, agent_id: String, agent_secret: S
     config.region = "private".to_string();
     config.agent_type = "private".to_string();
     crate::ssrf::set_allow_private_targets(true);
+    let allow_metadata = std::env::var("OKSTATUS_ALLOW_CLOUD_METADATA")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    crate::ssrf::set_allow_cloud_metadata(allow_metadata);
 }
 
 fn looks_like_uuid(id: &str) -> bool {

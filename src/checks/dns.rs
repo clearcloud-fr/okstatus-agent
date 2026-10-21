@@ -46,7 +46,7 @@ pub async fn check_dns(task: &CheckTask) -> CheckResult {
         // Anti-SSRF: reject private/reserved IPs for DNS server (UPT-48).
         // OKS-401 — lifted in private mode: a customer's agent querying its
         // own internal DNS server is the expected use.
-        if !ssrf::allow_private_targets() && ssrf::is_private_ip(&addr.ip()) {
+        if ssrf::is_blocked_ip(&addr.ip()) {
             return error_result(task, &start, "DNS server address is a private or reserved IP".to_string());
         }
 
